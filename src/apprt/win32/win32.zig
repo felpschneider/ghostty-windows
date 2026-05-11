@@ -431,6 +431,13 @@ pub extern "user32" fn GetWindowLongPtrW(
     nIndex: i32,
 ) callconv(.winapi) isize;
 
+pub extern "user32" fn GetClassLongW(
+    hWnd: HWND,
+    nIndex: i32,
+) callconv(.winapi) u32;
+
+pub const GCW_ATOM: i32 = -32;
+
 pub const GetCursorPos_ = struct {
     extern "user32" fn GetCursorPos(
         lpPoint: *POINT,
@@ -507,9 +514,6 @@ pub extern "user32" fn ToUnicode(
 pub extern "user32" fn GetKeyboardState(
     lpKeyState: *[256]u8,
 ) callconv(.winapi) i32;
-
-pub const MAPVK_VK_TO_CHAR: u32 = 2;
-pub extern "user32" fn MapVirtualKeyW(uCode: u32, uMapType: u32) callconv(.winapi) u32;
 
 pub extern "user32" fn SetCapture(
     hWnd: HWND,

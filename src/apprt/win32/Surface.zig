@@ -79,15 +79,6 @@ ime_composing: bool = false,
 /// Unicode (VK_PACKET), or direct PostMessage.
 key_event_produced_text: bool = false,
 
-/// Set to true when a dead key (combining accent, e.g. `~`, `´` on ABNT2)
-/// WM_KEYDOWN is detected. Detection uses a double ToUnicode call: the first
-/// call may produce the wrong character (dead key self-composing due to
-/// TranslateMessage's pre-set state); the second call on the now-clean state
-/// returns -1 confirming the VK is a dead key AND correctly restores the
-/// pending dead-key state for TranslateMessage. On the next key press, ToUnicode
-/// is skipped and WM_CHAR delivers the composed character via handleCharEvent.
-dead_key_pending: bool = false,
-
 /// Whether the user is actively dragging a window border/titlebar.
 /// During live resize, handleResize blocks until the renderer draws
 /// one frame at the new size (or a timeout expires), eliminating the
@@ -1601,86 +1592,38 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
     self.key_event_produced_text = false;
 
     if ((actual_action == .press or actual_action == .repeat) and !isModifierVk(vk)) {
-        if (self.dead_key_pending) {
-            // The previous key was a dead key. Skip ToUnicode entirely:
-            // TranslateMessage already holds the pending dead-key state and
-            // will post WM_CHAR with the fully composed character (e.g. `ã`
-            // from `~`+`a`). key_event_produced_text stays false so WM_CHAR
-            // reaches handleCharEvent and is forwarded to the terminal.
-            self.dead_key_pending = false;
-        } else {
-            var keyboard_state: [256]u8 = undefined;
-            if (w32.GetKeyboardState(&keyboard_state) != 0) {
-                // Mask to 8 bits — bit 24 of lparam is the extended-key flag,
-                // not part of the scancode. Including it produced wrong
-                // ToUnicode translations for AltGr layouts (German, Polish,
-                // etc.) and arrow/numpad keys. Matches the parallel call in
-                // sendWin32InputEvent below.
-                const scancode: u32 = @intCast((lparam >> 16) & 0xFF);
-                var utf16_buf: [4]u16 = undefined;
-                const result = w32.ToUnicode(
-                    @intCast(vk),
-                    scancode,
-                    &keyboard_state,
-                    &utf16_buf,
-                    utf16_buf.len,
-                    0,
-                );
-                if (result > 0) {
-                    // ToUnicode produced text. But the Win32 message loop runs
-                    // TranslateMessage before DispatchMessage, so for a dead key
-                    // WM_KEYDOWN, TranslateMessage already set the pending dead-key
-                    // state before we got here. Our ToUnicode call then composed the
-                    // dead key with itself (e.g. `~`+`~`=`~`) and cleared the state —
-                    // the wrong result.
-                    //
-                    // Detect this by calling ToUnicode a second time for the same VK.
-                    // After the first call consumed the TranslateMessage state, the
-                    // second call on a clean internal state will return -1 if and only
-                    // if this VK is actually a dead key. As a side-effect, that second
-                    // call correctly re-sets the dead-key state so that TranslateMessage
-                    // can use it when composing the next key via WM_CHAR.
-                    var probe_buf: [4]u16 = undefined;
-                    const probe = w32.ToUnicode(
-                        @intCast(vk),
-                        scancode,
-                        &keyboard_state,
-                        &probe_buf,
-                        probe_buf.len,
-                        0,
-                    );
-                    if (probe < 0) {
-                        // VK is a dead key. The first ToUnicode call gave the wrong
-                        // character due to TranslateMessage state interference.
-                        // The probe call restored the dead-key state correctly.
-                        // Let WM_CHAR deliver the composed result via handleCharEvent.
-                        self.dead_key_pending = true;
-                    } else {
-                        // Normal key — use the result from the first ToUnicode call.
-                        const utf16_slice = utf16_buf[0..@intCast(result)];
-                        // Only use the text if it's a printable character.
-                        // When Ctrl is held, ToUnicode returns control chars
-                        // (0x01-0x1A) which would interfere with the core's
-                        // Ctrl+key binding/encoding. Let the core handle
-                        // modifier combos via key + mods fields instead.
-                        const is_printable = utf16_slice[0] >= 0x20;
-                        if (is_printable) {
-                            const len = std.unicode.utf16LeToUtf8(&utf8_buf, utf16_slice) catch 0;
-                            if (len > 0) {
-                                utf8_text = utf8_buf[0..len];
-                                // Shift was consumed to produce the text (e.g., Shift+a = 'A')
-                                if (mods.shift) consumed_mods.shift = true;
-                                // Flag that we produced text — the subsequent
-                                // WM_CHAR from TranslateMessage should be suppressed.
-                                self.key_event_produced_text = true;
-                            }
-                        }
+        // App.run skips TranslateMessage for surface keyboard messages, so
+        // this ToUnicode call owns the per-queue dead-key state. result>0
+        // means composed text (including composition with a previously
+        // pending dead key); result<0 means VK is itself a dead key and
+        // ToUnicode just stored it for the next call.
+        var keyboard_state: [256]u8 = undefined;
+        if (w32.GetKeyboardState(&keyboard_state) != 0) {
+            // Mask to 8 bits — bit 24 of lparam is the extended-key flag,
+            // not part of the scancode. Including it broke ToUnicode for
+            // AltGr layouts (German, Polish) and arrow/numpad keys.
+            const scancode: u32 = @intCast((lparam >> 16) & 0xFF);
+            var utf16_buf: [4]u16 = undefined;
+            const result = w32.ToUnicode(
+                @intCast(vk),
+                scancode,
+                &keyboard_state,
+                &utf16_buf,
+                utf16_buf.len,
+                0,
+            );
+            if (result > 0) {
+                const utf16_slice = utf16_buf[0..@intCast(result)];
+                // Skip Ctrl-induced control chars (0x01-0x1A): the core
+                // handles modifier combos via key + mods, and emitting
+                // the control char here would double-encode.
+                if (utf16_slice[0] >= 0x20) {
+                    const len = std.unicode.utf16LeToUtf8(&utf8_buf, utf16_slice) catch 0;
+                    if (len > 0) {
+                        utf8_text = utf8_buf[0..len];
+                        if (mods.shift) consumed_mods.shift = true;
+                        self.key_event_produced_text = true;
                     }
-                } else if (result < 0) {
-                    // ToUnicode returned -1 directly: dead key with no prior
-                    // TranslateMessage interference. Track it and let WM_CHAR
-                    // deliver the composed result.
-                    self.dead_key_pending = true;
                 }
             }
         }
@@ -2049,18 +1992,17 @@ fn sendWin32InputEvent(self: *Surface, vk: u16, lparam: isize, action: input.Act
                 0,
             );
             if (result > 0) {
+                // Composed (or literal) char — possibly produced by
+                // combining with a previously-pending dead key.
                 unicode_char = utf16_buf[0];
             } else if (result < 0) {
-                // Dead key. utf16_buf[0] holds the dead character;
-                // surface it as Uc so applications reading INPUT_RECORDs
-                // (e.g. Claude Code via ConPTY in Win32 Input Mode) can
-                // see the keystroke. Then drain the kernel state — we're
-                // not going to compose this dead key locally, and any
-                // residual state would corrupt the very next ToUnicode
-                // call, swapping JIS-layout characters for US-layout
-                // ones until ghostty restarts.
-                unicode_char = utf16_buf[0];
-                clearKernelKeyboardState();
+                // VK is a dead key. ToUnicode stored it in the queue's
+                // dead-key state; the next press's ToUnicode call will
+                // compose with it. Send Uc=0 so applications reading the
+                // sequence don't see a stray dead char. The state is safe
+                // to keep because App.run skips TranslateMessage for
+                // surface windows — we are the only consumer.
+                unicode_char = 0;
             }
         }
     }
@@ -2143,7 +2085,14 @@ pub fn handleFocus(self: *Surface, focused: bool) void {
     // otherwise they would combine with the next character when focus returns.
     if (!focused) {
         self.high_surrogate = 0;
-        self.dead_key_pending = false;
+        // Drain any pending dead-key state so an unfinished compose
+        // doesn't bleed into the next focused surface or another app.
+        var ks: [256]u8 = undefined;
+        if (w32.GetKeyboardState(&ks) != 0) {
+            var buf: [4]u16 = undefined;
+            _ = w32.ToUnicode(@intCast(w32.VK_SPACE), 0, &ks, &buf, buf.len, 0);
+            _ = w32.ToUnicode(@intCast(w32.VK_SPACE), 0, &ks, &buf, buf.len, 0);
+        }
     }
     self.core_surface.focusCallback(focused) catch |err| {
         log.err("focus callback error: {}", .{err});
@@ -2221,34 +2170,6 @@ fn isModifierVk(vk: u16) bool {
         => true,
         else => false,
     };
-}
-
-/// Drain any buffered dead-key state from the kernel's per-thread
-/// keyboard state. ToUnicode returns -1 when the input is a dead key and
-/// stores the dead character in kernel state; the next ToUnicode call
-/// then composes against that buffered character. When we forward the
-/// raw key event verbatim (e.g. via Win32 Input Mode), there's no later
-/// composition to consume the buffered dead key, and it would silently
-/// corrupt every subsequent translation in this thread until ghostty
-/// exits — which manifests as a JIS layout appearing to switch to US in
-/// applications reading INPUT_RECORDs from ConPTY. We clock ToUnicode
-/// with a non-dead-key VK (numpad decimal) and an empty modifier state
-/// until it stops returning negative, mirroring wezterm's
-/// `KeyboardLayoutInfo::clear_key_state`.
-fn clearKernelKeyboardState() void {
-    var out_buf: [16]u16 = undefined;
-    const empty_state: [256]u8 = [_]u8{0} ** 256;
-    var guard: u8 = 0;
-    while (w32.ToUnicode(
-        w32.VK_DECIMAL,
-        0,
-        &empty_state,
-        &out_buf,
-        out_buf.len,
-        0,
-    ) < 0) : (guard += 1) {
-        if (guard >= 8) break;
-    }
 }
 
 /// Map a Win32 virtual key code to a Ghostty input.Key.

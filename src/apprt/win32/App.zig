@@ -291,7 +291,21 @@ pub fn run(self: *App) !void {
             }
         }
 
-        _ = w32.TranslateMessage(&msg);
+        // Skip TranslateMessage for keyboard events on terminal surface
+        // windows: handleKeyEvent (and sendWin32InputEvent in Win32 input
+        // mode) calls ToUnicode directly, and TranslateMessage's internal
+        // ToUnicodeEx mutates the same per-queue dead-key state — racing
+        // it broke dead-key composition on ABNT2 (`~`+`a` → `~a`). Edit
+        // controls (search, palette, tab rename) still need it.
+        const skip_translate = switch (msg.message) {
+            w32.WM_KEYDOWN, w32.WM_KEYUP, w32.WM_SYSKEYDOWN, w32.WM_SYSKEYUP => blk: {
+                const h = msg.hwnd orelse break :blk false;
+                const atom: u16 = @intCast(w32.GetClassLongW(h, w32.GCW_ATOM) & 0xFFFF);
+                break :blk atom != 0 and atom == self.terminal_class_atom;
+            },
+            else => false,
+        };
+        if (!skip_translate) _ = w32.TranslateMessage(&msg);
         _ = w32.DispatchMessageW(&msg);
     }
 }
@@ -1722,10 +1736,10 @@ fn surfaceWndProc(
         },
 
         w32.WM_DEADCHAR, w32.WM_SYSDEADCHAR => {
-            // Dead key pressed (e.g. `~`, `´` on ABNT2). handleKeyEvent
-            // already detected the dead key via MapVirtualKeyW and set
-            // dead_key_pending; the composed character arrives later in
-            // WM_CHAR. Suppress this message explicitly.
+            // The message loop skips TranslateMessage for surface windows,
+            // so WM_DEADCHAR is normally never posted for them. If one
+            // arrives via another path (e.g. SendInput), drop it — dead
+            // keys are composed via ToUnicode in handleKeyEvent.
             return 0;
         },
 
